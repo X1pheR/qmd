@@ -1991,6 +1991,7 @@ class LLMSession implements ILLMSession {
   private abortController: AbortController;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
   private name: string;
+  private unlinkExternalSignal: (() => void) | null = null;
 
   constructor(manager: LLMSessionManager, options: LLMSessionOptions = {}) {
     this.manager = manager;
@@ -2002,9 +2003,10 @@ class LLMSession implements ILLMSession {
       if (options.signal.aborted) {
         this.abortController.abort(options.signal.reason);
       } else {
-        options.signal.addEventListener("abort", () => {
-          this.abortController.abort(options.signal!.reason);
-        }, { once: true });
+        const signal = options.signal;
+        const onAbort = () => this.abortController.abort(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.unlinkExternalSignal = () => signal.removeEventListener("abort", onAbort);
       }
     }
 
@@ -2042,6 +2044,8 @@ class LLMSession implements ILLMSession {
       this.maxDurationTimer = null;
     }
 
+    this.unlinkExternalSignal?.();
+    this.unlinkExternalSignal = null;
     this.abortController.abort(new Error("Session released"));
     this.manager.release();
   }

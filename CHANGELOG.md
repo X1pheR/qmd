@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- SDK embedding accepts an optional AbortSignal. Cancellation stops admitting
+  later work, awaits native operations already in flight, and leaves unfinished
+  documents eligible for another embedding run. #1061
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
