@@ -13,6 +13,8 @@
 
 ### Added
 
+- Opt-in embedded MCP `sourceRoot` mapping adds exact source-relative query metadata for an authoritative filesystem handoff, using current registered collection paths without filesystem reads or path caches.
+
 - Opt-in embedded MCP `split-rerank` query policy, with routine no-rerank search and a separate reranked tool bounded to 20 candidates. Existing server defaults remain unchanged.
 
 - Added Oxlint lint fence.

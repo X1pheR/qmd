@@ -10,7 +10,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { fileURLToPath } from "url";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
@@ -51,6 +51,8 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
+  collection?: string | null;
+  source_relative_path?: string | null;
   line: number;   // Absolute line in source markdown
   snippet: string;
 };
@@ -116,6 +118,28 @@ type StatusResult = {
 function encodeQmdPath(path: string): string {
   // Encode each path segment separately to preserve slashes
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+/**
+ * Map indexed spelling to configured source-root metadata, without reading files.
+ * This lexical mapping does not authorize filesystem access or follow symlinks.
+ */
+function sourceHandoff(
+  displayPath: string,
+  root: string,
+  store: QMDStore,
+): { collection: string | null; source_relative_path: string | null } {
+  const slash = displayPath.indexOf("/");
+  const collection = slash > 0 ? displayPath.slice(0, slash) : null;
+  const missing = { collection, source_relative_path: null };
+  if (!collection) return missing;
+  const originalPath = displayPath.slice(slash + 1);
+  const collectionPath = store.internal.getCollectionByName(collection)?.pwd;
+  if (!collectionPath || !originalPath || isAbsolute(originalPath)
+    || originalPath.split(/[\\/]/).includes("..")) return missing;
+  const mapped = relative(root, resolve(collectionPath, originalPath));
+  if (mapped === ".." || mapped.startsWith(".." + sep) || isAbsolute(mapped)) return missing;
+  return { collection, source_relative_path: mapped.split(sep).join("/") };
 }
 
 /**
@@ -251,6 +275,8 @@ function getInstructions(store: QMDStore): Promise<string> {
 export interface McpServerOptions {
   /** Separate routine no-rerank queries from explicitly selected bounded reranking. */
   queryPolicy?: "standard" | "split-rerank";
+  /** Add lexical source-relative query metadata beneath this configured root. */
+  sourceRoot?: string;
 }
 
 export async function createMcpServer(
@@ -261,6 +287,7 @@ export async function createMcpServer(
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
   // work to settle before disposing the store/llm underneath it.
   const track = inflight?.track ?? (<T,>(fn: T): T => fn);
+  const sourceRoot = options.sourceRoot ? resolve(options.sourceRoot) : undefined;
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     {
@@ -398,7 +425,7 @@ export async function createMcpServer(
           ? "Reranking is disabled for this routine tool. Select query_reranked explicitly when needed.\n\n"
           : queryMode === "reranked" ? "Explicit LLM reranking with at most 20 candidates.\n\n" : "") + `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
 
-Each result includes a \`line\` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call \`get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)\`.
+${sourceRoot ? "Each result includes a `line` field with the absolute 1-indexed line of the best match. When `source_relative_path` is present, use it for handoff to the authoritative filesystem for current source text; that consumer must enforce its own Roots/access policy. Use `get` when indexed QMD text itself is needed." : "Each result includes a `line` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call `get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)`."}
 
 ## Query Types
 
@@ -514,6 +541,7 @@ Intent-aware lex (C++ performance, not sports):
           return {
             docid: `#${r.docid}`,
             file: r.displayPath,
+          ...(sourceRoot ? sourceHandoff(r.displayPath, sourceRoot, store) : {}),
             title: r.title,
             score: Math.round(r.score * 100) / 100,
             context: r.context,
