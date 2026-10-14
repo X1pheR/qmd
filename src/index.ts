@@ -392,6 +392,8 @@ export interface QMDStore {
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
     force?: boolean;
+    /** Retain and resume only identical interrupted embedding plans. Default: false. */
+    resume?: boolean;
     model?: string;
     /** Restrict embedding to documents in one collection. */
     collection?: string;
@@ -654,6 +656,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     embed: async (embedOpts) => {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
+        resume: embedOpts?.resume,
         model: embedOpts?.model,
         collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,

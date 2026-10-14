@@ -1301,6 +1301,7 @@ function initializeDatabase(db: Database): void {
       model TEXT NOT NULL,
       embed_fingerprint TEXT NOT NULL DEFAULT '',
       total_chunks INTEGER NOT NULL DEFAULT 1,
+      chunk_plan_hash TEXT NOT NULL DEFAULT '',
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
     )
@@ -1656,7 +1657,7 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string, planHash?: string) => void;
 };
 
 // =============================================================================
@@ -2111,6 +2112,8 @@ export type EmbedResult = {
 
 export type EmbedOptions = {
   force?: boolean;
+  /** Keep completed chunks from interrupted plans and resume only identical plans. Default: false. */
+  resume?: boolean;
   model?: string;
   /**
    * Restrict embedding to documents in a single collection.
@@ -2156,6 +2159,7 @@ type ChunkItem = {
   tokens: number;
   bytes: number;
   expectedTotalChunks: number;
+  planHash: string;
 };
 
 function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
@@ -2179,8 +2183,65 @@ const CONTENT_VECTOR_DESIRED_COLUMNS: { name: string; definition: string }[] = [
   { name: "model", definition: "TEXT NOT NULL DEFAULT ''" },
   { name: "embed_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
   { name: "total_chunks", definition: "INTEGER NOT NULL DEFAULT 1" },
+  { name: "chunk_plan_hash", definition: "TEXT NOT NULL DEFAULT ''" },
   { name: "embedded_at", definition: "TEXT NOT NULL DEFAULT ''" },
 ];
+
+// Legacy rows retain their existing completeness rules. Checkpoint rows also
+// need one coherent plan across every model/fingerprint row of the same hash.
+const CHECKPOINT_CHUNK_COUNT_SQL = `CASE WHEN
+  EXISTS (SELECT 1 FROM content_vectors cp
+    WHERE cp.hash = content_vectors.hash AND cp.chunk_plan_hash != '')
+  AND (MIN(chunk_plan_hash) != MAX(chunk_plan_hash)
+    OR MIN(seq) != 0 OR MAX(seq) != MAX(total_chunks) - 1
+    OR MIN(total_chunks) != MAX(total_chunks)
+    OR EXISTS (SELECT 1 FROM content_vectors cp
+      WHERE cp.hash = content_vectors.hash AND
+        (cp.chunk_plan_hash != content_vectors.chunk_plan_hash
+          OR cp.model != content_vectors.model
+          OR cp.embed_fingerprint != content_vectors.embed_fingerprint
+          OR cp.total_chunks != content_vectors.total_chunks)))
+  THEN 0 ELSE COUNT(*) END`;
+
+function embeddingPlanHash(chunks: readonly ChunkItem[], model: string, fingerprint: string): string {
+  const digest = createHash("sha256").update(JSON.stringify(["embedding-plan-v1", model, fingerprint, chunks.length]));
+  for (const chunk of chunks) {
+    digest.update(JSON.stringify([chunk.seq, chunk.pos, formatDocForEmbedding(chunk.text, chunk.title, model)]));
+  }
+  return digest.digest("hex");
+}
+
+function checkpointSequences(
+  db: Database, chunks: readonly ChunkItem[], model: string, fingerprint: string, resume: boolean,
+): Set<number> {
+  if (chunks.length === 0) return new Set();
+  const hash = chunks[0]!.hash;
+  return withLazyContentVectorMigration(db, () => db.transaction(() => {
+    const rows = db.prepare(`SELECT seq, pos, model, embed_fingerprint, total_chunks, chunk_plan_hash
+      FROM content_vectors WHERE hash = ?`).all(hash) as Array<{
+        seq: number; pos: number; model: string; embed_fingerprint: string; total_chunks: number; chunk_plan_hash: string;
+      }>;
+    if (rows.length === 0 || (!resume && rows.every(row => row.chunk_plan_hash === ""))) return new Set<number>();
+    const lookup = hasVectorIndex(db) ? storedEmbeddingLookup(db) : undefined;
+    const valid = resume && rows.every(row => {
+      const chunk = chunks[row.seq];
+      return chunk !== undefined && row.pos === chunk.pos && row.total_chunks === chunks.length
+        && row.model === model && row.embed_fingerprint === fingerprint
+        && row.chunk_plan_hash === chunk.planHash && lookup?.(hash, row.seq) !== undefined;
+    });
+    if (!valid) {
+      deletePartitionRowsOfHash(db, hash);
+      db.prepare("DELETE FROM content_vectors WHERE hash = ?").run(hash);
+      return new Set<number>();
+    }
+    return new Set(rows.map(row => row.seq));
+  }).immediate());
+}
+
+function hasEmbeddingCheckpoints(db: Database): boolean {
+  return withLazyContentVectorMigration(db, () =>
+    Boolean(db.prepare("SELECT 1 FROM content_vectors WHERE chunk_plan_hash != '' LIMIT 1").get()));
+}
 
 function isContentVectorColumnError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -2207,6 +2268,8 @@ function ensureContentVectorsStatusIndex(db: Database): void {
       CREATE INDEX IF NOT EXISTS idx_content_vectors_model_fingerprint
       ON content_vectors(model, embed_fingerprint, hash, total_chunks)
     `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_content_vectors_checkpoints
+      ON content_vectors(hash) WHERE chunk_plan_hash != ''`);
   } catch (error) {
     if (!isContentVectorColumnError(error)) {
       throw error;
@@ -2255,7 +2318,7 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       FROM documents d
       JOIN content c ON d.hash = c.hash
       LEFT JOIN (
-        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        SELECT hash, model, ${CHECKPOINT_CHUNK_COUNT_SQL} AS chunk_count, MAX(total_chunks) AS expected_chunks
         FROM content_vectors
         WHERE model = ? AND embed_fingerprint = ?
         GROUP BY hash, model, embed_fingerprint
@@ -2412,7 +2475,7 @@ export async function generateEmbeddings(
           if (!options?.signal?.aborted) recordFailure(chunk, "embedding returned no vector");
           return false;
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.planHash);
         chunksEmbedded++;
         successesSinceRetry++;
         clearFailure(chunk);
@@ -2475,8 +2538,9 @@ export async function generateEmbeddings(
         );
         if (!session.isValid) break;
 
+        const planned: ChunkItem[] = [];
         for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
+          planned.push({
             hash: doc.hash,
             path: doc.path,
             title,
@@ -2486,8 +2550,15 @@ export async function generateEmbeddings(
             tokens: chunks[seq]!.tokens,
             bytes: encoder.encode(chunks[seq]!.text).length,
             expectedTotalChunks: chunks.length,
+            planHash: "",
           });
         }
+        if (options?.resume) {
+          const planHash = embeddingPlanHash(planned, model, fingerprint);
+          for (const chunk of planned) chunk.planHash = planHash;
+        }
+        const saved = checkpointSequences(db, planned, model, fingerprint, options?.resume ?? false);
+        for (const chunk of planned) if (!saved.has(chunk.seq)) batchChunks.push(chunk);
         expectedChunksByHash.set(doc.hash, chunks.length);
       }
 
@@ -2551,7 +2622,7 @@ export async function generateEmbeddings(
               const chunk = chunkBatch[i]!;
               const embedding = embeddings[i];
               if (embedding) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.planHash);
                 stored.push(chunk);
               } else {
                 unembedded.push(chunk);
@@ -2603,7 +2674,7 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+      const removedPartialChunks = options?.resume ? 0 : removeIncompleteEmbeddings(db, expectedChunksByHash, model);
       if (removedPartialChunks > 0) {
         chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
       }
@@ -2716,7 +2787,7 @@ export function createStore(dbPath?: string): Store {
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string, planHash?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint, planHash),
   };
 
   return store;
@@ -2983,7 +3054,7 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
       SELECT COUNT(DISTINCT d.hash) as count
       FROM documents d
       LEFT JOIN (
-        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        SELECT hash, model, ${CHECKPOINT_CHUNK_COUNT_SQL} AS chunk_count, MAX(total_chunks) AS expected_chunks
         FROM content_vectors
         WHERE model = ? AND embed_fingerprint = ?
         GROUP BY hash, model, embed_fingerprint
@@ -4872,10 +4943,27 @@ function compileCurrentMetadataFilter(filter: MetadataFilter): { sql: string; pa
  * eligibility subquery itself rather than a bound list of rowids, so however
  * many rows a filter admits, none of them is read onto the heap.
  */
-function knnVecScanner(db: Database, partitioned: boolean, filter?: MetadataFilter): (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] {
+function knnVecScanner(db: Database, partitioned: boolean, filter?: MetadataFilter, checkpointModel?: string): (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] {
   const conditions = ["embedding MATCH ?", "k = ?"];
   if (partitioned) conditions.push("collection_id = ?");
-  const eligible = filter ? metadataEligibleRowsSql(filter) : undefined;
+  const eligible = filter ? metadataEligibleRowsSql(filter)
+    : checkpointModel !== undefined ? { sql: ` FROM ${VEC_ROWS_TABLE} vr WHERE 1 = 1`, params: [] as SQLiteValue[] }
+    : undefined;
+  if (eligible && checkpointModel !== undefined) {
+    eligible.sql += ` AND (
+      NOT EXISTS (SELECT 1 FROM content_vectors cp WHERE cp.hash = vr.hash AND cp.chunk_plan_hash != '')
+      OR (EXISTS (SELECT 1 FROM content_vectors WHERE hash = vr.hash
+        GROUP BY hash HAVING MAX(total_chunks) > 0
+          AND ${CHECKPOINT_CHUNK_COUNT_SQL} = MAX(total_chunks)
+          AND MIN(model) = ? AND MAX(model) = ?
+          AND MIN(embed_fingerprint) = ? AND MAX(embed_fingerprint) = ?
+          AND MIN(chunk_plan_hash) != '')
+        AND (SELECT COUNT(*) FROM ${VEC_ROWS_TABLE} cp
+          WHERE cp.hash = vr.hash AND cp.collection_id = vr.collection_id)
+          = (SELECT MAX(total_chunks) FROM content_vectors WHERE hash = vr.hash)))`;
+    const fingerprint = getEmbeddingFingerprint(checkpointModel);
+    eligible.params.push(checkpointModel, checkpointModel, fingerprint, fingerprint);
+  }
   if (eligible) conditions.push(`rowid IN (SELECT vr.id ${eligible.sql}${partitioned ? " AND vr.collection_id = ?" : ""})`);
   const statement = db.prepare(`
     SELECT rowid, distance
@@ -5001,65 +5089,69 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
-  const names = scopedCollectionNames(collectionName);
-  let collectionIds: number[] | undefined;
-  if (names) {
-    collectionIds = Array.from(resolveCollectionIds(db, names).values());
-    if (collectionIds.length === 0) return [];
-  }
-  const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
+  // The checkpoint probe and every KNN scan must share a read snapshot:
+  // another connection can publish the first partial checkpoint between them.
+  // Resolve embeddings before entering this synchronous transaction.
+  return db.transaction(() => {
+    const names = scopedCollectionNames(collectionName);
+    let collectionIds: number[] | undefined;
+    if (names) {
+      collectionIds = Array.from(resolveCollectionIds(db, names).values());
+      if (collectionIds.length === 0) return [];
+    }
+    const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
 
-  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
-  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
-  // "optimize" this by combining into a single query with JOINs - it will break.
-  // See: https://github.com/tobi/qmd/pull/23
+    // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
+    // hang indefinitely when combined with JOINs in the same query. Do NOT try to
+    // "optimize" this by combining into a single query with JOINs - it will break.
+    // See: https://github.com/tobi/qmd/pull/23
 
-  // Step 1 gets vector matches from sqlite-vec (no JOINs allowed), one KNN per
-  // collection in scope; step 2 resolves them to documents. One statement per
-  // member rather than `collection_id IN (...)`: the IN form yields k rows per
-  // value only because SQLite runs vec0's filter once per value, which is a
-  // planner detail rather than a vec0 contract.
-  const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
-  const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
-  if (scanTargets.length === 0) return [];
-  const scan = knnVecScanner(db, collectionIds !== undefined, filter);
-  const resolve = vecDocumentResolver(db, filter);
-  const queryVec = new Float32Array(embedding);
-  // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
-  // put its whole text on the heap for each result.
-  const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
+    // Step 1 gets vector matches from sqlite-vec (no JOINs allowed), one KNN per
+    // collection in scope; step 2 resolves them to documents. One statement per
+    // member rather than `collection_id IN (...)`: the IN form yields k rows per
+    // value only because SQLite runs vec0's filter once per value, which is a
+    // planner detail rather than a vec0 contract.
+    const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
+    const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
+    if (scanTargets.length === 0) return [];
+    const scan = knnVecScanner(db, collectionIds !== undefined, filter, hasEmbeddingCheckpoints(db) ? model : undefined);
+    const resolve = vecDocumentResolver(db, filter);
+    const queryVec = new Float32Array(embedding);
+    // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
+    // put its whole text on the heap for each result.
+    const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
 
-  // Each target yields its own nearest `limit` documents (or all it holds), so
-  // merging them by distance gives the scope's exact nearest `limit`. Ties go
-  // to the smaller filepath, as in searchFTS.
-  return scanTargets
-    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
-    .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
-    .slice(0, limit)
-    .flatMap((row): SearchResult[] => {
-      // The body is read after resolution, outside its snapshot: another
-      // process's orphaned-content cleanup can delete the row in between.
-      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
-      if (content == null) return [];
-      const body = content.doc;
-      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-      return [{
-        filepath: row.filepath,
-        displayPath: row.display_path,
-        title: row.title,
-        hash: row.hash,
-        docid: getDocid(row.hash),
-        collectionName,
-        modifiedAt: "",  // Not available in vec query
-        bodyLength: body.length,
-        body,
-        context: getContextForFile(db, row.filepath),
-        metadata: parseMetadataJson(row.metadata_json),
-        score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
-        source: "vec" as const,
-        chunkPos: row.pos,
-      }];
-    });
+    // Each target yields its own nearest `limit` documents (or all it holds), so
+    // merging them by distance gives the scope's exact nearest `limit`. Ties go
+    // to the smaller filepath, as in searchFTS.
+    return scanTargets
+      .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+      .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
+      .slice(0, limit)
+      .flatMap((row): SearchResult[] => {
+        // Load the body on the same snapshot as eligibility and resolution.
+        const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+        if (content == null) return [];
+        const body = content.doc;
+        const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+        return [{
+          filepath: row.filepath,
+          displayPath: row.display_path,
+          title: row.title,
+          hash: row.hash,
+          docid: getDocid(row.hash),
+          collectionName,
+          modifiedAt: "",  // Not available in vec query
+          bodyLength: body.length,
+          body,
+          context: getContextForFile(db, row.filepath),
+          metadata: parseMetadataJson(row.metadata_json),
+          score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
+          source: "vec" as const,
+          chunkPos: row.pos,
+        }];
+      });
+  })();
 }
 
 // =============================================================================
@@ -5087,7 +5179,7 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
-      SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+      SELECT hash, model, ${CHECKPOINT_CHUNK_COUNT_SQL} AS chunk_count, MAX(total_chunks) AS expected_chunks
       FROM content_vectors
       WHERE model = ? AND embed_fingerprint = ?
       GROUP BY hash, model, embed_fingerprint
@@ -5232,12 +5324,13 @@ export function insertEmbedding(
   model: string,
   embeddedAt: string,
   totalChunks: number = 1,
-  fingerprint: string = getEmbeddingFingerprint(model)
+  fingerprint: string = getEmbeddingFingerprint(model),
+  planHash: string = "",
 ): void {
   withLazyContentVectorMigration(db, () => {
     db.transaction(() => {
-      db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
+      db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at, chunk_plan_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt, planHash);
       for (const collection of activeCollectionsOfHash(db, hash)) {
         upsertPartitionVector(db, hash, seq, allocateCollectionId(db, collection), embedding);
       }
