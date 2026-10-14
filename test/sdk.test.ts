@@ -1090,6 +1090,34 @@ describe("embed", () => {
     }
   });
 
+  test("store.embed forwards the shared sweep duration budget and awaits its native batch", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } },
+    });
+    const fakeLlm = createFakeEmbedLlm();
+    const embedBatch = fakeLlm.embedBatch;
+    let nativeFinished = false;
+    fakeLlm.embedBatch = async texts => {
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      const value = await embedBatch(texts);
+      nativeFinished = true;
+      return value;
+    };
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+    try {
+      await store.update();
+      await store.embed({ maxDurationMs: 1, maxDocsPerBatch: 1 });
+      expect(nativeFinished).toBe(true);
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(store.internal.getHashesNeedingEmbedding()).toBeGreaterThanOrEqual(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
   test("store.embed forwards batch limit options", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
